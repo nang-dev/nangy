@@ -19,13 +19,24 @@ struct AssemblyAIStreamingTranscriptionProviderError: LocalizedError {
 final class AssemblyAIStreamingTranscriptionProvider: BuddyTranscriptionProvider {
     /// URL for the Cloudflare Worker endpoint that returns a short-lived
     /// AssemblyAI streaming token. The real API key never leaves the server.
-    private static let tokenProxyURL = "https://your-worker-name.your-subdomain.workers.dev/transcribe-token"
+    private static let defaultTokenProxyURL = "https://your-worker-name.your-subdomain.workers.dev/transcribe-token"
+
+    private var tokenProxyURL: String {
+        AppBundleConfiguration.stringValue(forKey: "AssemblyAITranscriptionTokenProxyURL")
+            ?? Self.defaultTokenProxyURL
+    }
 
     let displayName = "AssemblyAI"
     let requiresSpeechRecognitionPermission = false
 
-    var isConfigured: Bool { true }
-    var unavailableExplanation: String? { nil }
+    var isConfigured: Bool {
+        !tokenProxyURL.contains("your-worker-name.your-subdomain.workers.dev")
+    }
+
+    var unavailableExplanation: String? {
+        guard !isConfigured else { return nil }
+        return "AssemblyAI streaming transcription is not configured."
+    }
 
     /// Single long-lived URLSession shared across all streaming sessions.
     /// Creating and invalidating a URLSession per session corrupts the OS
@@ -39,9 +50,16 @@ final class AssemblyAIStreamingTranscriptionProvider: BuddyTranscriptionProvider
         onFinalTranscriptReady: @escaping (String) -> Void,
         onError: @escaping (Error) -> Void
     ) async throws -> any BuddyStreamingTranscriptionSession {
+        guard isConfigured else {
+            nangyLog("AssemblyAI transcription requested without configured proxy", category: .transcription, level: .error)
+            throw AssemblyAIStreamingTranscriptionProviderError(
+                message: unavailableExplanation ?? "AssemblyAI streaming transcription is not configured."
+            )
+        }
+
         // Fetch a fresh temporary token from the proxy before each session
         let temporaryToken = try await fetchTemporaryToken()
-        print("🎙️ AssemblyAI: fetched temporary token (\(temporaryToken.prefix(20))...)")
+        nangyLog("AssemblyAI temporary token fetched", category: .transcription, level: .debug)
 
         let session = AssemblyAIStreamingTranscriptionSession(
             apiKey: nil,
@@ -59,7 +77,14 @@ final class AssemblyAIStreamingTranscriptionProvider: BuddyTranscriptionProvider
 
     /// Calls the Cloudflare Worker to get a short-lived AssemblyAI token.
     private func fetchTemporaryToken() async throws -> String {
-        var request = URLRequest(url: URL(string: Self.tokenProxyURL)!)
+        guard let proxyURL = URL(string: tokenProxyURL) else {
+            nangyLog("AssemblyAI token proxy URL is invalid", category: .transcription, level: .error)
+            throw AssemblyAIStreamingTranscriptionProviderError(
+                message: "AssemblyAI token proxy URL is invalid."
+            )
+        }
+
+        var request = URLRequest(url: proxyURL)
         request.httpMethod = "POST"
 
         let (data, response) = try await URLSession.shared.data(for: request)
@@ -68,6 +93,11 @@ final class AssemblyAIStreamingTranscriptionProvider: BuddyTranscriptionProvider
               (200...299).contains(httpResponse.statusCode) else {
             let statusCode = (response as? HTTPURLResponse)?.statusCode ?? -1
             let body = String(data: data, encoding: .utf8) ?? "unknown"
+            nangyLog(
+                "AssemblyAI token fetch failed status=\(statusCode) bodyPreview=\(NangyLogger.preview(body, limit: 220))",
+                category: .transcription,
+                level: .error
+            )
             throw AssemblyAIStreamingTranscriptionProviderError(
                 message: "Failed to fetch AssemblyAI token (HTTP \(statusCode)): \(body)"
             )
@@ -75,6 +105,7 @@ final class AssemblyAIStreamingTranscriptionProvider: BuddyTranscriptionProvider
 
         guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let token = json["token"] as? String else {
+            nangyLog("AssemblyAI token proxy returned invalid JSON", category: .transcription, level: .error)
             throw AssemblyAIStreamingTranscriptionProviderError(
                 message: "Invalid token response from proxy."
             )
@@ -397,11 +428,16 @@ private final class AssemblyAIStreamingTranscriptionSession: NSObject, BuddyStre
             if self.isAwaitingExplicitFinalTranscript
                 && !self.hasDeliveredFinalTranscript
                 && !latestTranscriptText.isEmpty {
-                print("[AssemblyAI] ⚠️ WebSocket error during active session, delivering partial transcript as fallback: \(error.localizedDescription)")
+                nangyLog(
+                    "AssemblyAI websocket error during finalization, delivering partial transcript fallback",
+                    category: .transcription,
+                    level: .warning
+                )
+                nangyLog(error: error, context: "AssemblyAI websocket fallback", category: .transcription)
                 self.deliverFinalTranscriptIfNeeded(latestTranscriptText)
                 return
             }
-            print("[AssemblyAI] ❌ Session failed with error: \(error.localizedDescription)")
+            nangyLog(error: error, context: "AssemblyAI session failed", category: .transcription)
 
             self.onError(error)
         }

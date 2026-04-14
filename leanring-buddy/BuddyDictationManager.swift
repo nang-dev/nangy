@@ -51,7 +51,7 @@ enum BuddyPushToTalkShortcut {
             }
         }
 
-        fileprivate var modifierOnlyFlags: NSEvent.ModifierFlags? {
+        var modifierOnlyFlags: NSEvent.ModifierFlags? {
             switch self {
             case .shiftFunction:
                 return [.shift, .function]
@@ -64,7 +64,7 @@ enum BuddyPushToTalkShortcut {
             }
         }
 
-        fileprivate var spaceShortcutModifierFlags: NSEvent.ModifierFlags? {
+        var spaceShortcutModifierFlags: NSEvent.ModifierFlags? {
             switch self {
             case .shiftFunction:
                 return nil
@@ -262,6 +262,15 @@ final class BuddyDictationManager: NSObject, ObservableObject {
         return AVCaptureDevice.authorizationStatus(for: .audio) == .notDetermined
     }
 
+    var requiresSpeechRecognitionPermission: Bool {
+        transcriptionProvider.requiresSpeechRecognitionPermission
+    }
+
+    var hasSpeechRecognitionPermission: Bool {
+        guard transcriptionProvider.requiresSpeechRecognitionPermission else { return true }
+        return SFSpeechRecognizer.authorizationStatus() == .authorized
+    }
+
     private let transcriptionProvider: any BuddyTranscriptionProvider
     private let audioEngine = AVAudioEngine()
     private var activeTranscriptionSession: (any BuddyStreamingTranscriptionSession)?
@@ -383,10 +392,10 @@ final class BuddyDictationManager: NSObject, ObservableObject {
     ) async {
         guard !isDictationInProgress else { return }
 
-        print("🎙️ BuddyDictationManager: start requested (\(startSource))")
+        nangyLog("dictation start requested source=\(String(describing: startSource))", category: .voice)
 
         if needsInitialPermissionPrompt {
-            print("🎙️ BuddyDictationManager: requesting initial permissions")
+            nangyLog("dictation requesting initial permissions", category: .voice, level: .debug)
             NSApplication.shared.activate(ignoringOtherApps: true)
 
             do {
@@ -405,17 +414,17 @@ final class BuddyDictationManager: NSObject, ObservableObject {
         isPreparingToRecord = true
 
         guard await requestMicrophoneAndSpeechPermissionsWithoutDuplicatePrompts() else {
-            print("🎙️ BuddyDictationManager: permissions missing or denied")
+            nangyLog("dictation permissions missing or denied", category: .voice, level: .warning)
             isPreparingToRecord = false
             return
         }
         guard !Task.isCancelled else {
-            print("🎙️ BuddyDictationManager: start cancelled (shortcut released during permission check)")
+            nangyLog("dictation start cancelled during permission check", category: .voice, level: .debug)
             isPreparingToRecord = false
             return
         }
         guard pendingStartRequestIdentifier == startRequestIdentifier else {
-            print("🎙️ BuddyDictationManager: start request superseded")
+            nangyLog("dictation start request superseded", category: .voice, level: .debug)
             isPreparingToRecord = false
             return
         }
@@ -442,7 +451,7 @@ final class BuddyDictationManager: NSObject, ObservableObject {
         lastRecordedAudioPowerSampleDate = .distantPast
 
         guard !Task.isCancelled else {
-            print("🎙️ BuddyDictationManager: start cancelled (shortcut released before recording began)")
+            nangyLog("dictation start cancelled before recording began", category: .voice, level: .debug)
             resetSessionState()
             return
         }
@@ -450,7 +459,7 @@ final class BuddyDictationManager: NSObject, ObservableObject {
         do {
             try await startRecognitionSession()
             guard !Task.isCancelled else {
-                print("🎙️ BuddyDictationManager: start cancelled (shortcut released during session start)")
+                nangyLog("dictation start cancelled during session start", category: .voice, level: .debug)
                 audioEngine.stop()
                 audioEngine.inputNode.removeTap(onBus: 0)
                 activeTranscriptionSession?.cancel()
@@ -461,14 +470,22 @@ final class BuddyDictationManager: NSObject, ObservableObject {
                 microphoneButtonRecordingStartedAt = Date()
             }
             isPreparingToRecord = false
-            print("🎙️ BuddyDictationManager: recognition session started")
+            nangyLog(
+                "dictation recognition session started provider=\(transcriptionProvider.displayName)",
+                category: .voice
+            )
         } catch {
             isPreparingToRecord = false
             lastErrorMessage = userFacingErrorMessage(
                 from: error,
                 fallback: "couldn't start voice input. try again."
             )
-            print("❌ BuddyDictationManager: failed to start recognition session (\(transcriptionProvider.displayName)): \(error)")
+            nangyLog(
+                "failed to start recognition session provider=\(transcriptionProvider.displayName)",
+                category: .voice,
+                level: .error
+            )
+            nangyLog(error: error, context: "Dictation start failure", category: .voice)
             resetSessionState()
         }
     }
@@ -482,7 +499,7 @@ final class BuddyDictationManager: NSObject, ObservableObject {
         }
         guard !isFinalizingTranscript else { return }
 
-        print("🎙️ BuddyDictationManager: stop requested (\(expectedStartSource))")
+        nangyLog("dictation stop requested source=\(String(describing: expectedStartSource))", category: .voice)
 
         isRecordingFromMicrophoneButton = false
         isRecordingFromKeyboardShortcut = false
@@ -515,7 +532,7 @@ final class BuddyDictationManager: NSObject, ObservableObject {
         activeTranscriptionSession?.cancel()
         activeTranscriptionSession = nil
 
-        print("🎙️ BuddyDictationManager: opening transcription provider \(transcriptionProvider.displayName)")
+        nangyLog("opening transcription provider=\(transcriptionProvider.displayName)", category: .transcription)
 
         let activeTranscriptionSession = try await transcriptionProvider.startStreamingSession(
             keyterms: buildTranscriptionKeyterms(),
@@ -544,7 +561,7 @@ final class BuddyDictationManager: NSObject, ObservableObject {
         )
 
         self.activeTranscriptionSession = activeTranscriptionSession
-        print("🎙️ BuddyDictationManager: provider ready, starting audio engine")
+        nangyLog("transcription provider ready, starting audio engine", category: .voice, level: .debug)
 
         let inputNode = audioEngine.inputNode
         let inputFormat = inputNode.outputFormat(forBus: 0)
@@ -569,7 +586,12 @@ final class BuddyDictationManager: NSObject, ObservableObject {
                 shouldSubmitFinalDraft: shouldAutomaticallySubmitFinalDraft
             )
         } else {
-            print("❌ Buddy dictation error (\(transcriptionProvider.displayName)): \(error)")
+            nangyLog(
+                "dictation error provider=\(transcriptionProvider.displayName)",
+                category: .voice,
+                level: .error
+            )
+            nangyLog(error: error, context: "Buddy dictation error", category: .voice)
             lastErrorMessage = userFacingErrorMessage(
                 from: error,
                 fallback: "couldn't transcribe that. try again."

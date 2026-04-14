@@ -14,9 +14,13 @@ import Foundation
 
 final class GlobalPushToTalkShortcutMonitor: ObservableObject {
     let shortcutTransitionPublisher = PassthroughSubject<BuddyPushToTalkShortcut.ShortcutTransition, Never>()
+    private static let modifierOnlyReleaseDebounceSeconds = 0.12
+    private static let modifierOnlyReleasePollIntervalSeconds = 0.12
 
     private var globalEventTap: CFMachPort?
     private var globalEventTapRunLoopSource: CFRunLoopSource?
+    private var pendingReleaseWorkItem: DispatchWorkItem?
+    private var modifierOnlyReleasePollTimer: Timer?
     /// Mutated exclusively from the CGEvent tap callback, which runs on
     /// `CFRunLoopGetMain()` and therefore always executes on the main thread.
     /// Published so the overlay can hide immediately on key release without
@@ -62,7 +66,7 @@ final class GlobalPushToTalkShortcutMonitor: ObservableObject {
             callback: eventTapCallback,
             userInfo: Unmanaged.passUnretained(self).toOpaque()
         ) else {
-            print("⚠️ Global push-to-talk: couldn't create CGEvent tap")
+            nangyLog("could not create CGEvent tap", category: .voice, level: .warning)
             return
         }
 
@@ -72,7 +76,7 @@ final class GlobalPushToTalkShortcutMonitor: ObservableObject {
             0
         ) else {
             CFMachPortInvalidate(globalEventTap)
-            print("⚠️ Global push-to-talk: couldn't create event tap run loop source")
+            nangyLog("could not create event tap run loop source", category: .voice, level: .warning)
             return
         }
 
@@ -81,9 +85,14 @@ final class GlobalPushToTalkShortcutMonitor: ObservableObject {
 
         CFRunLoopAddSource(CFRunLoopGetMain(), globalEventTapRunLoopSource, .commonModes)
         CGEvent.tapEnable(tap: globalEventTap, enable: true)
+        nangyLog("global push-to-talk event tap started", category: .voice, level: .debug)
     }
 
     func stop() {
+        pendingReleaseWorkItem?.cancel()
+        pendingReleaseWorkItem = nil
+        modifierOnlyReleasePollTimer?.invalidate()
+        modifierOnlyReleasePollTimer = nil
         isShortcutCurrentlyPressed = false
 
         if let globalEventTapRunLoopSource {
@@ -95,6 +104,8 @@ final class GlobalPushToTalkShortcutMonitor: ObservableObject {
             CFMachPortInvalidate(globalEventTap)
             self.globalEventTap = nil
         }
+
+        nangyLog("global push-to-talk event tap stopped", category: .voice, level: .debug)
     }
 
     private func handleGlobalEventTap(
@@ -120,13 +131,82 @@ final class GlobalPushToTalkShortcutMonitor: ObservableObject {
         case .none:
             break
         case .pressed:
+            pendingReleaseWorkItem?.cancel()
+            pendingReleaseWorkItem = nil
             isShortcutCurrentlyPressed = true
+            startModifierOnlyReleasePollIfNeeded()
+            nangyLog("shortcut transition=pressed", category: .voice, level: .debug)
             shortcutTransitionPublisher.send(.pressed)
         case .released:
-            isShortcutCurrentlyPressed = false
-            shortcutTransitionPublisher.send(.released)
+            if BuddyPushToTalkShortcut.currentShortcutOption.modifierOnlyFlags != nil {
+                pendingReleaseWorkItem?.cancel()
+
+                let releaseWorkItem = DispatchWorkItem { [weak self] in
+                    guard let self else { return }
+                    self.pendingReleaseWorkItem = nil
+                    guard self.isShortcutCurrentlyPressed else { return }
+                    self.stopModifierOnlyReleasePoll()
+                    self.isShortcutCurrentlyPressed = false
+                    nangyLog("shortcut transition=released (debounced)", category: .voice, level: .debug)
+                    self.shortcutTransitionPublisher.send(.released)
+                }
+
+                pendingReleaseWorkItem = releaseWorkItem
+                DispatchQueue.main.asyncAfter(
+                    deadline: .now() + Self.modifierOnlyReleaseDebounceSeconds,
+                    execute: releaseWorkItem
+                )
+            } else {
+                stopModifierOnlyReleasePoll()
+                isShortcutCurrentlyPressed = false
+                nangyLog("shortcut transition=released", category: .voice, level: .debug)
+                shortcutTransitionPublisher.send(.released)
+            }
         }
 
         return Unmanaged.passUnretained(event)
+    }
+
+    private func startModifierOnlyReleasePollIfNeeded() {
+        guard BuddyPushToTalkShortcut.currentShortcutOption.modifierOnlyFlags != nil else { return }
+        guard modifierOnlyReleasePollTimer == nil else { return }
+
+        modifierOnlyReleasePollTimer = Timer.scheduledTimer(
+            withTimeInterval: Self.modifierOnlyReleasePollIntervalSeconds,
+            repeats: true
+        ) { [weak self] _ in
+            self?.pollModifierOnlyShortcutState()
+        }
+    }
+
+    private func stopModifierOnlyReleasePoll() {
+        modifierOnlyReleasePollTimer?.invalidate()
+        modifierOnlyReleasePollTimer = nil
+    }
+
+    private func pollModifierOnlyShortcutState() {
+        guard let requiredModifierFlags = BuddyPushToTalkShortcut.currentShortcutOption.modifierOnlyFlags else {
+            stopModifierOnlyReleasePoll()
+            return
+        }
+
+        guard isShortcutCurrentlyPressed else {
+            stopModifierOnlyReleasePoll()
+            return
+        }
+
+        let currentModifierFlags = NSEvent.ModifierFlags(
+            rawValue: UInt(CGEventSource.flagsState(.combinedSessionState).rawValue)
+        )
+        .intersection(.deviceIndependentFlagsMask)
+
+        guard !currentModifierFlags.contains(requiredModifierFlags) else { return }
+
+        pendingReleaseWorkItem?.cancel()
+        pendingReleaseWorkItem = nil
+        stopModifierOnlyReleasePoll()
+        isShortcutCurrentlyPressed = false
+        nangyLog("shortcut release synthesized from modifier poll", category: .voice, level: .warning)
+        shortcutTransitionPublisher.send(.released)
     }
 }

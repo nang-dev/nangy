@@ -12,6 +12,8 @@ import Combine
 import Foundation
 import PostHog
 import ScreenCaptureKit
+import Security
+import Speech
 import SwiftUI
 
 enum CompanionVoiceState {
@@ -21,8 +23,806 @@ enum CompanionVoiceState {
     case responding
 }
 
+enum ClickyAuthMode: String, CaseIterable, Codable, Identifiable {
+    case chatGPTOAuth
+    case apiKey
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .chatGPTOAuth:
+            return "OAuth"
+        case .apiKey:
+            return "API Key"
+        }
+    }
+
+    var subtitle: String {
+        switch self {
+        case .chatGPTOAuth:
+            return "Use the ChatGPT/Codex sign-in already available on this Mac."
+        case .apiKey:
+            return "Use your OpenAI Platform API key stored in Keychain."
+        }
+    }
+}
+
+enum ClickyReasoningEffort: String, CaseIterable, Codable, Identifiable {
+    case minimal
+    case low
+    case medium
+    case high
+    case xhigh
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .minimal:
+            return "Minimal"
+        case .low:
+            return "Low"
+        case .medium:
+            return "Medium"
+        case .high:
+            return "High"
+        case .xhigh:
+            return "XHigh"
+        }
+    }
+}
+
+enum ClickyServiceTier: String, CaseIterable, Codable, Identifiable {
+    case fast
+    case flex
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .fast:
+            return "Fast"
+        case .flex:
+            return "Flex"
+        }
+    }
+}
+
+struct ClickyPreferences: Codable, Equatable {
+    var authMode: ClickyAuthMode
+    var model: String
+    var reasoningEffort: ClickyReasoningEffort
+    var serviceTier: ClickyServiceTier
+
+    static let `default` = ClickyPreferences(
+        authMode: .chatGPTOAuth,
+        model: "gpt-5.4",
+        reasoningEffort: .xhigh,
+        serviceTier: .fast
+    )
+}
+
+@MainActor
+final class ClickySettingsStore: ObservableObject {
+    @Published private(set) var preferences: ClickyPreferences
+
+    private let defaults: UserDefaults
+    private let storageKey = "Clicky.Preferences"
+
+    init(defaults: UserDefaults = .standard) {
+        self.defaults = defaults
+
+        if
+            let data = defaults.data(forKey: storageKey),
+            let decoded = try? JSONDecoder().decode(ClickyPreferences.self, from: data)
+        {
+            preferences = decoded
+        } else {
+            preferences = .default
+        }
+    }
+
+    func update(_ mutate: (inout ClickyPreferences) -> Void) {
+        var copy = preferences
+        mutate(&copy)
+        preferences = copy
+        persist()
+    }
+
+    private func persist() {
+        guard let data = try? JSONEncoder().encode(preferences) else { return }
+        defaults.set(data, forKey: storageKey)
+    }
+}
+
+enum ClickyAssistantError: LocalizedError {
+    case settingsRequired
+
+    var errorDescription: String? {
+        switch self {
+        case .settingsRequired:
+            return "Connect OpenAI in Nangy Settings first."
+        }
+    }
+}
+
+enum ClickyKeychainStoreError: LocalizedError {
+    case unexpectedStatus(OSStatus)
+
+    var errorDescription: String? {
+        switch self {
+        case .unexpectedStatus(let status):
+            return "Keychain operation failed with status \(status)."
+        }
+    }
+}
+
+final class ClickyKeychainStore {
+    private let service = Bundle.main.bundleIdentifier ?? "com.clicky.app"
+
+    func loadString(for account: String) -> String? {
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: account,
+            kSecReturnData as String: true,
+            kSecMatchLimit as String: kSecMatchLimitOne
+        ]
+
+        var item: CFTypeRef?
+        let status = SecItemCopyMatching(query as CFDictionary, &item)
+        guard status != errSecItemNotFound else { return nil }
+        guard status == errSecSuccess else { return nil }
+        guard let data = item as? Data else { return nil }
+        return String(data: data, encoding: .utf8)
+    }
+
+    func saveString(_ value: String, for account: String) throws {
+        let data = Data(value.utf8)
+        let baseQuery: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: account
+        ]
+
+        let update: [String: Any] = [kSecValueData as String: data]
+        let updateStatus = SecItemUpdate(baseQuery as CFDictionary, update as CFDictionary)
+
+        if updateStatus == errSecSuccess {
+            return
+        }
+
+        if updateStatus != errSecItemNotFound {
+            throw ClickyKeychainStoreError.unexpectedStatus(updateStatus)
+        }
+
+        var createQuery = baseQuery
+        createQuery[kSecValueData as String] = data
+
+        let createStatus = SecItemAdd(createQuery as CFDictionary, nil)
+        guard createStatus == errSecSuccess else {
+            throw ClickyKeychainStoreError.unexpectedStatus(createStatus)
+        }
+    }
+
+    func deleteValue(for account: String) throws {
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: account
+        ]
+
+        let status = SecItemDelete(query as CFDictionary)
+        guard status == errSecSuccess || status == errSecItemNotFound else {
+            throw ClickyKeychainStoreError.unexpectedStatus(status)
+        }
+    }
+}
+
+enum CodexCLIError: LocalizedError {
+    case commandUnavailable
+    case notLoggedIn
+    case commandFailed(String)
+    case emptyOutput
+
+    var errorDescription: String? {
+        switch self {
+        case .commandUnavailable:
+            return "Codex CLI is not installed or is not available on PATH."
+        case .notLoggedIn:
+            return "Sign in with ChatGPT first before using OAuth mode."
+        case .commandFailed(let message):
+            return message
+        case .emptyOutput:
+            return "Codex returned an empty result."
+        }
+    }
+}
+
+struct CodexAuthStatus: Equatable {
+    var isInstalled: Bool
+    var isLoggedIn: Bool
+    var authMode: String?
+    var detail: String
+
+    static let unknown = CodexAuthStatus(
+        isInstalled: false,
+        isLoggedIn: false,
+        authMode: nil,
+        detail: "Codex CLI status has not been checked yet."
+    )
+}
+
+enum CodexLoginState: Equatable {
+    case idle
+    case checking
+    case awaitingBrowser(url: URL, code: String)
+    case waitingForCompletion(String)
+    case completed(String)
+    case failed(String)
+}
+
+@MainActor
+final class ClickyCodexCLIService: ObservableObject {
+    @Published private(set) var authStatus: CodexAuthStatus = .unknown
+    @Published private(set) var loginState: CodexLoginState = .idle
+
+    private static let deviceAuthLandingURL = URL(string: "https://auth.openai.com/codex/device")!
+
+    private var loginProcess: Process?
+    private var loginOutputBuffer = ""
+    private var lastOpenedLoginURL: URL?
+
+    func refreshStatus() async {
+        nangyLog("refreshing Codex auth status", category: .codex, level: .debug)
+        await refreshStatus(updateLoginState: true)
+    }
+
+    func startDeviceAuth() {
+        nangyLog("starting Codex device auth flow", category: .codex)
+        if case .awaitingBrowser(let url, _) = loginState {
+            openBrowser(url)
+            return
+        }
+
+        if loginProcess != nil {
+            cancelActiveLoginAttempt()
+        }
+
+        let process = Process()
+        let stdout = Pipe()
+        let stderr = Pipe()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+        process.arguments = ["codex", "login", "--device-auth"]
+        process.standardOutput = stdout
+        process.standardError = stderr
+
+        loginProcess = process
+        loginOutputBuffer = ""
+        lastOpenedLoginURL = nil
+        loginState = .waitingForCompletion("Launching ChatGPT sign-in…")
+        openBrowser(Self.deviceAuthLandingURL)
+
+        stdout.fileHandleForReading.readabilityHandler = { [weak self] handle in
+            let data = handle.availableData
+            guard !data.isEmpty else { return }
+            Task { @MainActor in
+                self?.consumeLoginOutput(data)
+            }
+        }
+
+        stderr.fileHandleForReading.readabilityHandler = { [weak self] handle in
+            let data = handle.availableData
+            guard !data.isEmpty else { return }
+            Task { @MainActor in
+                self?.consumeLoginOutput(data)
+            }
+        }
+
+        process.terminationHandler = { [weak self] process in
+            Task { @MainActor in
+                guard let self else { return }
+                stdout.fileHandleForReading.readabilityHandler = nil
+                stderr.fileHandleForReading.readabilityHandler = nil
+                self.loginProcess = nil
+
+                if process.terminationStatus == 0 {
+                    nangyLog("Codex device auth finished successfully", category: .codex)
+                    self.loginState = .completed("ChatGPT sign-in finished.")
+                    await self.refreshStatus(updateLoginState: false)
+                } else {
+                    let output = Self.sanitize(self.loginOutputBuffer)
+                    nangyLog(
+                        "Codex device auth failed status=\(process.terminationStatus) output=\(NangyLogger.preview(output, limit: 220))",
+                        category: .codex,
+                        level: .error
+                    )
+                    self.loginState = .failed(output.isEmpty ? "Codex login did not complete." : output)
+                    await self.refreshStatus(updateLoginState: false)
+                }
+            }
+        }
+
+        do {
+            try process.run()
+        } catch {
+            nangyLog(error: error, context: "failed to start Codex device auth", category: .codex)
+            loginProcess = nil
+            loginState = .failed(error.localizedDescription)
+        }
+    }
+
+    func generateResponse(
+        images: [(data: Data, label: String)],
+        systemPrompt: String,
+        conversationHistory: [(userTranscript: String, assistantResponse: String)],
+        userPrompt: String,
+        model: String,
+        reasoning: ClickyReasoningEffort,
+        serviceTier: ClickyServiceTier
+    ) async throws -> String {
+        guard authStatus.isInstalled else {
+            throw CodexCLIError.commandUnavailable
+        }
+
+        if !authStatus.isLoggedIn {
+            await refreshStatus(updateLoginState: false)
+        }
+
+        guard authStatus.isLoggedIn else {
+            throw CodexCLIError.notLoggedIn
+        }
+
+        let temporaryDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("clicky-codex-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: temporaryDirectory,
+            withIntermediateDirectories: true,
+            attributes: nil
+        )
+
+        defer {
+            try? FileManager.default.removeItem(at: temporaryDirectory)
+        }
+
+        let outputURL = temporaryDirectory.appendingPathComponent("response.txt")
+
+        var arguments: [String] = [
+            "codex",
+            "exec",
+            "--skip-git-repo-check",
+            "--ephemeral",
+            "-C", NSHomeDirectory(),
+            "-m", model,
+            "-c", "model_reasoning_effort=\"\(reasoning.rawValue)\"",
+            "-c", "service_tier=\"\(serviceTier.rawValue)\"",
+            "-o", outputURL.path
+        ]
+
+        for (index, image) in images.enumerated() {
+            let fileExtension = image.data.isPNGData ? "png" : "jpg"
+            let imageURL = temporaryDirectory.appendingPathComponent("clicky-screen-\(index).\(fileExtension)")
+            try image.data.write(to: imageURL)
+            arguments.append(contentsOf: ["-i", imageURL.path])
+        }
+
+        let prompt = buildPrompt(
+            imageLabels: images.map(\.label),
+            systemPrompt: systemPrompt,
+            conversationHistory: conversationHistory,
+            userPrompt: userPrompt
+        )
+
+        arguments.append("--")
+        arguments.append(prompt)
+
+        nangyLog(
+            "running Codex exec model=\(model) reasoning=\(reasoning.rawValue) tier=\(serviceTier.rawValue) images=\(images.count) historyCount=\(conversationHistory.count)",
+            category: .codex
+        )
+
+        _ = try await runCommand(arguments)
+
+        let text = try String(contentsOf: outputURL, encoding: .utf8)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+
+        guard !text.isEmpty else {
+            nangyLog("Codex exec returned empty output file", category: .codex, level: .error)
+            throw CodexCLIError.emptyOutput
+        }
+
+        nangyLog("Codex exec completed outputLength=\(text.count)", category: .codex)
+        return text
+    }
+
+    func transformText(
+        prompt: String,
+        systemPrompt: String,
+        model: String,
+        reasoning: ClickyReasoningEffort,
+        serviceTier: ClickyServiceTier
+    ) async throws -> String {
+        guard authStatus.isInstalled else {
+            throw CodexCLIError.commandUnavailable
+        }
+
+        if !authStatus.isLoggedIn {
+            await refreshStatus(updateLoginState: false)
+        }
+
+        guard authStatus.isLoggedIn else {
+            throw CodexCLIError.notLoggedIn
+        }
+
+        let temporaryDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("clicky-codex-text-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: temporaryDirectory,
+            withIntermediateDirectories: true,
+            attributes: nil
+        )
+
+        defer {
+            try? FileManager.default.removeItem(at: temporaryDirectory)
+        }
+
+        let outputURL = temporaryDirectory.appendingPathComponent("response.txt")
+        let fullPrompt = """
+        \(systemPrompt)
+
+        additional rules:
+        - respond with only the final text to insert.
+        - do not add surrounding quotes, markdown, labels, or commentary.
+
+        \(prompt)
+        """
+
+        nangyLog(
+            "running Codex text transform model=\(model) reasoning=\(reasoning.rawValue) tier=\(serviceTier.rawValue) promptLength=\(prompt.count)",
+            category: .codex
+        )
+
+        _ = try await runCommand([
+            "codex",
+            "exec",
+            "--skip-git-repo-check",
+            "--ephemeral",
+            "-C", NSHomeDirectory(),
+            "-m", model,
+            "-c", "model_reasoning_effort=\"\(reasoning.rawValue)\"",
+            "-c", "service_tier=\"\(serviceTier.rawValue)\"",
+            "-o", outputURL.path,
+            "--",
+            fullPrompt
+        ])
+
+        let text = try String(contentsOf: outputURL, encoding: .utf8)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+
+        guard !text.isEmpty else {
+            nangyLog("Codex text transform returned empty output file", category: .codex, level: .error)
+            throw CodexCLIError.emptyOutput
+        }
+
+        nangyLog("Codex text transform completed outputLength=\(text.count)", category: .codex)
+        return text
+    }
+
+    private func buildPrompt(
+        imageLabels: [String],
+        systemPrompt: String,
+        conversationHistory: [(userTranscript: String, assistantResponse: String)],
+        userPrompt: String
+    ) -> String {
+        let imageLabelSection: String
+        if imageLabels.isEmpty {
+            imageLabelSection = "no screenshots attached."
+        } else {
+            imageLabelSection = imageLabels.enumerated().map { index, label in
+                "image \(index + 1): \(label)"
+            }
+            .joined(separator: "\n")
+        }
+
+        let conversationSection: String
+        if conversationHistory.isEmpty {
+            conversationSection = "no prior conversation."
+        } else {
+            conversationSection = conversationHistory.map { exchange in
+                """
+                user: \(exchange.userTranscript)
+                clicky: \(exchange.assistantResponse)
+                """
+            }
+            .joined(separator: "\n\n")
+        }
+
+        return """
+        \(systemPrompt)
+
+        additional rules:
+        - respond directly in plain text.
+        - do not use shell tools, web search, or inspect the filesystem.
+        - use only the attached images and the conversation below.
+        - attached screenshots are in this order:
+        \(imageLabelSection)
+
+        conversation so far:
+        \(conversationSection)
+
+        current user request:
+        \(userPrompt)
+        """
+    }
+
+    private func refreshStatus(updateLoginState: Bool) async {
+        if updateLoginState {
+            loginState = .checking
+        }
+
+        do {
+            let result = try await runCommand(["codex", "login", "status"])
+            let output = Self.sanitize(result.combinedOutput)
+            let isLoggedIn = output.localizedCaseInsensitiveContains("logged in")
+            let authMode = output.localizedCaseInsensitiveContains("chatgpt") ? "ChatGPT" : nil
+
+            authStatus = CodexAuthStatus(
+                isInstalled: true,
+                isLoggedIn: isLoggedIn,
+                authMode: authMode,
+                detail: output.isEmpty ? "Codex CLI is available." : output
+            )
+            nangyLog(
+                "Codex auth status installed=true loggedIn=\(isLoggedIn) authMode=\(authMode ?? "unknown") detail=\(NangyLogger.preview(output, limit: 180))",
+                category: .codex
+            )
+            if updateLoginState {
+                loginState = .idle
+            }
+        } catch CodexCLIError.commandUnavailable {
+            authStatus = CodexAuthStatus(
+                isInstalled: false,
+                isLoggedIn: false,
+                authMode: nil,
+                detail: "Codex CLI was not found on this Mac."
+            )
+            nangyLog("Codex CLI not found on PATH", category: .codex, level: .error)
+            if updateLoginState {
+                loginState = .failed("Install Codex CLI first to use ChatGPT OAuth mode.")
+            }
+        } catch {
+            authStatus = CodexAuthStatus(
+                isInstalled: true,
+                isLoggedIn: false,
+                authMode: nil,
+                detail: error.localizedDescription
+            )
+            nangyLog(error: error, context: "Codex auth refresh failed", category: .codex)
+            if updateLoginState {
+                loginState = .failed(error.localizedDescription)
+            }
+        }
+    }
+
+    private func consumeLoginOutput(_ data: Data) {
+        guard let text = String(data: data, encoding: .utf8) else { return }
+        loginOutputBuffer += text
+
+        let cleaned = Self.sanitize(loginOutputBuffer)
+        if let url = extractFirstURL(from: cleaned), let code = extractDeviceCode(from: cleaned) {
+            loginState = .awaitingBrowser(url: url, code: code)
+            if lastOpenedLoginURL != url {
+                openBrowser(url)
+            }
+            return
+        }
+
+        if !cleaned.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            loginState = .waitingForCompletion(cleaned)
+        }
+    }
+
+    private func cancelActiveLoginAttempt() {
+        guard let loginProcess else { return }
+        nangyLog("cancelling active Codex device auth attempt", category: .codex, level: .warning)
+
+        if let stdout = loginProcess.standardOutput as? Pipe {
+            stdout.fileHandleForReading.readabilityHandler = nil
+        }
+
+        if let stderr = loginProcess.standardError as? Pipe {
+            stderr.fileHandleForReading.readabilityHandler = nil
+        }
+
+        loginProcess.terminationHandler = nil
+        if loginProcess.isRunning {
+            loginProcess.terminate()
+        }
+
+        self.loginProcess = nil
+        loginOutputBuffer = ""
+        lastOpenedLoginURL = nil
+        loginState = .idle
+    }
+
+    @discardableResult
+    private func openBrowser(_ url: URL) -> Bool {
+        if NSWorkspace.shared.open(url) {
+            lastOpenedLoginURL = url
+            nangyLog("opened browser for Codex auth url=\(url.absoluteString)", category: .codex, level: .debug)
+            return true
+        }
+
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/open")
+        process.arguments = [url.absoluteString]
+
+        do {
+            try process.run()
+            lastOpenedLoginURL = url
+            nangyLog("opened browser via /usr/bin/open url=\(url.absoluteString)", category: .codex, level: .debug)
+            return true
+        } catch {
+            nangyLog(error: error, context: "failed to open browser for Codex auth", category: .codex)
+            return false
+        }
+    }
+
+    private func runCommand(_ arguments: [String]) async throws -> CLICommandResult {
+        nangyLog(
+            "running command=\(NangyLogger.preview(arguments.joined(separator: " "), limit: 260))",
+            category: .codex,
+            level: .debug
+        )
+        return try await withCheckedThrowingContinuation { continuation in
+            let process = Process()
+            let stdout = Pipe()
+            let stderr = Pipe()
+            process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+            process.arguments = arguments
+            process.currentDirectoryURL = URL(fileURLWithPath: NSHomeDirectory(), isDirectory: true)
+            process.standardOutput = stdout
+            process.standardError = stderr
+
+            process.terminationHandler = { process in
+                let output = String(data: stdout.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+                let errorOutput = String(data: stderr.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+                let combined = [output, errorOutput]
+                    .filter { !$0.isEmpty }
+                    .joined(separator: "\n")
+                let sanitizedCombined = Self.sanitize(combined)
+
+                if process.terminationStatus == 0 {
+                    nangyLog(
+                        "command finished status=0 output=\(NangyLogger.preview(sanitizedCombined, limit: 220))",
+                        category: .codex,
+                        level: .debug
+                    )
+                    continuation.resume(returning: CLICommandResult(
+                        standardOutput: output,
+                        standardError: errorOutput,
+                        combinedOutput: combined
+                    ))
+                } else if process.terminationStatus == 127 || combined.localizedCaseInsensitiveContains("not found") {
+                    nangyLog(
+                        "command unavailable status=\(process.terminationStatus) output=\(NangyLogger.preview(sanitizedCombined, limit: 220))",
+                        category: .codex,
+                        level: .error
+                    )
+                    continuation.resume(throwing: CodexCLIError.commandUnavailable)
+                } else {
+                    nangyLog(
+                        "command failed status=\(process.terminationStatus) output=\(NangyLogger.preview(sanitizedCombined, limit: 220))",
+                        category: .codex,
+                        level: .error
+                    )
+                    continuation.resume(throwing: CodexCLIError.commandFailed(sanitizedCombined))
+                }
+            }
+
+            do {
+                try process.run()
+            } catch {
+                nangyLog(error: error, context: "failed to launch command", category: .codex)
+                continuation.resume(throwing: CodexCLIError.commandUnavailable)
+            }
+        }
+    }
+
+    nonisolated private static func sanitize(_ text: String) -> String {
+        enum EscapeState {
+            case none
+            case escaped
+            case controlSequence
+            case operatingSystemCommand
+            case operatingSystemCommandEscape
+        }
+
+        var scalars: [UnicodeScalar] = []
+        var state: EscapeState = .none
+
+        for scalar in text.unicodeScalars {
+            switch state {
+            case .none:
+                if scalar == "\u{001B}" {
+                    state = .escaped
+                    continue
+                }
+
+                if CharacterSet.controlCharacters.contains(scalar), scalar != "\n", scalar != "\t" {
+                    continue
+                }
+
+                scalars.append(scalar)
+
+            case .escaped:
+                switch scalar {
+                case "[":
+                    state = .controlSequence
+                case "]":
+                    state = .operatingSystemCommand
+                default:
+                    state = .none
+                }
+
+            case .controlSequence:
+                if (0x40...0x7E).contains(scalar.value) {
+                    state = .none
+                }
+
+            case .operatingSystemCommand:
+                if scalar == "\u{0007}" {
+                    state = .none
+                } else if scalar == "\u{001B}" {
+                    state = .operatingSystemCommandEscape
+                }
+
+            case .operatingSystemCommandEscape:
+                state = scalar == "\\" ? .none : .operatingSystemCommand
+            }
+        }
+
+        return String(String.UnicodeScalarView(scalars)).trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private func extractFirstURL(from text: String) -> URL? {
+        guard
+            let detector = try? NSDataDetector(types: NSTextCheckingResult.CheckingType.link.rawValue)
+        else {
+            return nil
+        }
+
+        let range = NSRange(text.startIndex..., in: text)
+        return detector.matches(in: text, options: [], range: range).first?.url
+    }
+
+    private func extractDeviceCode(from text: String) -> String? {
+        let pattern = #"[A-Z0-9]{4,}-[A-Z0-9]{4,}"#
+        guard let range = text.range(of: pattern, options: .regularExpression) else {
+            return nil
+        }
+        return String(text[range])
+    }
+}
+
+private struct CLICommandResult {
+    let standardOutput: String
+    let standardError: String
+    let combinedOutput: String
+}
+
+private extension Data {
+    var isPNGData: Bool {
+        let pngSignature: [UInt8] = [0x89, 0x50, 0x4E, 0x47]
+        return count >= 4 && Array(prefix(4)) == pngSignature
+    }
+}
+
 @MainActor
 final class CompanionManager: ObservableObject {
+    static let shared = CompanionManager()
+
     @Published private(set) var voiceState: CompanionVoiceState = .idle
     @Published private(set) var lastTranscript: String?
     @Published private(set) var currentAudioPowerLevel: CGFloat = 0
@@ -30,9 +830,14 @@ final class CompanionManager: ObservableObject {
     @Published private(set) var hasScreenRecordingPermission = false
     @Published private(set) var hasMicrophonePermission = false
     @Published private(set) var hasScreenContentPermission = false
+    @Published private(set) var hasSpeechRecognitionPermission = true
+    @Published private(set) var preferences: ClickyPreferences
+    @Published private(set) var hasStoredAPIKey: Bool
+    @Published private(set) var codexAuthStatus: CodexAuthStatus = .unknown
+    @Published private(set) var codexLoginState: CodexLoginState = .idle
 
     /// Screen location (global AppKit coords) of a detected UI element the
-    /// buddy should fly to and point at. Parsed from Claude's response;
+    /// buddy should fly to and point at. Parsed from the model response;
     /// observed by BlueCursorView to trigger the flight animation.
     @Published var detectedElementScreenLocation: CGPoint?
     /// The display frame (global AppKit coords) of the screen the detected
@@ -71,17 +876,19 @@ final class CompanionManager: ObservableObject {
     /// Base URL for the Cloudflare Worker proxy. All API requests route
     /// through this so keys never ship in the app binary.
     private static let workerBaseURL = "https://your-worker-name.your-subdomain.workers.dev"
-
-    private lazy var claudeAPI: ClaudeAPI = {
-        return ClaudeAPI(proxyURL: "\(Self.workerBaseURL)/chat", model: selectedModel)
-    }()
+    private let apiKeyAccount = "openai_api_key"
+    private let settingsStore: ClickySettingsStore
+    private let keychainStore: ClickyKeychainStore
+    private let codexCLIService: ClickyCodexCLIService
+    private let accessibilityTextService: NangyAccessibilityTextService
+    private let openAIAPI: OpenAIAPI
 
     private lazy var elevenLabsTTSClient: ElevenLabsTTSClient = {
         return ElevenLabsTTSClient(proxyURL: "\(Self.workerBaseURL)/tts")
     }()
 
-    /// Conversation history so Claude remembers prior exchanges within a session.
-    /// Each entry is the user's transcript and Claude's response.
+    /// Conversation history so the assistant remembers prior exchanges within a session.
+    /// Each entry is the user's transcript and the assistant response.
     private var conversationHistory: [(userTranscript: String, assistantResponse: String)] = []
 
     /// The currently running AI response task, if any. Cancelled when the user
@@ -93,27 +900,170 @@ final class CompanionManager: ObservableObject {
     private var audioPowerCancellable: AnyCancellable?
     private var accessibilityCheckTimer: Timer?
     private var pendingKeyboardShortcutStartTask: Task<Void, Never>?
+    private var settingsCancellable: AnyCancellable?
+    private var codexAuthStatusCancellable: AnyCancellable?
+    private var codexLoginStateCancellable: AnyCancellable?
     /// Scheduled hide for transient cursor mode — cancelled if the user
     /// speaks again before the delay elapses.
     private var transientHideTask: Task<Void, Never>?
+    private var hasStarted = false
 
     /// True when all three required permissions (accessibility, screen recording,
     /// microphone) are granted. Used by the panel to show a single "all good" state.
     var allPermissionsGranted: Bool {
-        hasAccessibilityPermission && hasScreenRecordingPermission && hasMicrophonePermission && hasScreenContentPermission
+        hasAccessibilityPermission
+            && hasScreenRecordingPermission
+            && hasMicrophonePermission
+            && hasScreenContentPermission
+            && hasSpeechRecognitionPermission
+    }
+
+    /// The cursor overlay can be shown independently of voice/transcription setup.
+    /// This keeps Nangy visible even while the user is still finishing permissions.
+    private var shouldShowOverlayCursor: Bool {
+        isClickyCursorEnabled
     }
 
     /// Whether the blue cursor overlay is currently visible on screen.
     /// Used by the panel to show accurate status text ("Active" vs "Ready").
     @Published private(set) var isOverlayVisible: Bool = false
 
-    /// The Claude model used for voice responses. Persisted to UserDefaults.
-    @Published var selectedModel: String = UserDefaults.standard.string(forKey: "selectedClaudeModel") ?? "claude-sonnet-4-6"
+    var selectedModel: String {
+        preferences.model
+    }
 
     func setSelectedModel(_ model: String) {
-        selectedModel = model
-        UserDefaults.standard.set(model, forKey: "selectedClaudeModel")
-        claudeAPI.model = model
+        let trimmedModel = model.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedModel.isEmpty else { return }
+        settingsStore.update { $0.model = trimmedModel }
+    }
+
+    var selectedReasoningEffort: ClickyReasoningEffort {
+        preferences.reasoningEffort
+    }
+
+    func setSelectedReasoningEffort(_ reasoningEffort: ClickyReasoningEffort) {
+        settingsStore.update { $0.reasoningEffort = reasoningEffort }
+    }
+
+    var selectedServiceTier: ClickyServiceTier {
+        preferences.serviceTier
+    }
+
+    func setSelectedServiceTier(_ serviceTier: ClickyServiceTier) {
+        settingsStore.update { $0.serviceTier = serviceTier }
+    }
+
+    var selectedAuthMode: ClickyAuthMode {
+        preferences.authMode
+    }
+
+    func setSelectedAuthMode(_ authMode: ClickyAuthMode) {
+        settingsStore.update { $0.authMode = authMode }
+    }
+
+    var isCurrentAuthReady: Bool {
+        switch preferences.authMode {
+        case .apiKey:
+            return hasStoredAPIKey
+        case .chatGPTOAuth:
+            return codexAuthStatus.isLoggedIn
+        }
+    }
+
+    var currentAssistantSummary: String {
+        "\(preferences.model) · \(preferences.reasoningEffort.title) · \(preferences.serviceTier.title)"
+    }
+
+    var currentAuthSummary: String {
+        switch preferences.authMode {
+        case .apiKey:
+            return hasStoredAPIKey ? "API key saved" : "API key needed"
+        case .chatGPTOAuth:
+            if !codexAuthStatus.isInstalled {
+                return "Codex CLI needed"
+            }
+            return codexAuthStatus.isLoggedIn ? "OAuth connected" : "OAuth needed"
+        }
+    }
+
+    init() {
+        let settingsStore = ClickySettingsStore()
+        let keychainStore = ClickyKeychainStore()
+        let codexCLIService = ClickyCodexCLIService()
+        let accessibilityTextService = NangyAccessibilityTextService()
+        let openAIAPI = OpenAIAPI()
+
+        self.settingsStore = settingsStore
+        self.keychainStore = keychainStore
+        self.codexCLIService = codexCLIService
+        self.accessibilityTextService = accessibilityTextService
+        self.openAIAPI = openAIAPI
+        preferences = settingsStore.preferences
+        hasStoredAPIKey = !(keychainStore.loadString(for: apiKeyAccount)?.isEmpty ?? true)
+
+        settingsCancellable = settingsStore.$preferences
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] updatedPreferences in
+                self?.preferences = updatedPreferences
+            }
+
+        codexAuthStatusCancellable = codexCLIService.$authStatus
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] status in
+                self?.codexAuthStatus = status
+            }
+
+        codexLoginStateCancellable = codexCLIService.$loginState
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] loginState in
+                self?.codexLoginState = loginState
+            }
+
+        nangyLog(
+            "CompanionManager initialized authMode=\(preferences.authMode.rawValue) model=\(preferences.model) reasoning=\(preferences.reasoningEffort.rawValue) tier=\(preferences.serviceTier.rawValue) storedAPIKey=\(hasStoredAPIKey)",
+            category: .assistant
+        )
+    }
+
+    func openSettings() {
+        nangyLog("opening settings window", category: .ui)
+        NotificationCenter.default.post(name: .clickyDismissPanel, object: nil)
+        NangySettingsWindowController.shared.show(companionManager: self)
+    }
+
+    func refreshCodexAuthStatus() {
+        Task {
+            await codexCLIService.refreshStatus()
+        }
+    }
+
+    func startCodexDeviceAuth() {
+        nangyLog("user requested Codex OAuth sign-in", category: .auth)
+        codexCLIService.startDeviceAuth()
+    }
+
+    func resetAssistantDefaults() {
+        settingsStore.update { preferences in
+            preferences = .default
+        }
+    }
+
+    func saveAPIKey(_ value: String) throws {
+        let trimmedValue = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmedValue.isEmpty {
+            try keychainStore.deleteValue(for: apiKeyAccount)
+            nangyLog("deleted saved OpenAI API key", category: .auth)
+        } else {
+            try keychainStore.saveString(trimmedValue, for: apiKeyAccount)
+            nangyLog("saved OpenAI API key to Keychain", category: .auth)
+        }
+
+        hasStoredAPIKey = !trimmedValue.isEmpty
+    }
+
+    func loadAPIKey() -> String? {
+        keychainStore.loadString(for: apiKeyAccount)
     }
 
     /// User preference for whether the Clicky cursor should be shown.
@@ -128,6 +1078,7 @@ final class CompanionManager: ObservableObject {
         UserDefaults.standard.set(enabled, forKey: "isClickyCursorEnabled")
         transientHideTask?.cancel()
         transientHideTask = nil
+        nangyLog("cursor visibility preference updated enabled=\(enabled)", category: .ui)
 
         if enabled {
             overlayWindowManager.hasShownOverlayBefore = true
@@ -173,24 +1124,28 @@ final class CompanionManager: ObservableObject {
     }
 
     func start() {
+        guard !hasStarted else { return }
+        hasStarted = true
+
+        completeOnboardingStateIfNeeded()
         refreshAllPermissions()
-        print("🔑 Clicky start — accessibility: \(hasAccessibilityPermission), screen: \(hasScreenRecordingPermission), mic: \(hasMicrophonePermission), screenContent: \(hasScreenContentPermission), onboarded: \(hasCompletedOnboarding)")
+        refreshCodexAuthStatus()
+        nangyLog(
+            "start accessibility=\(hasAccessibilityPermission) screen=\(hasScreenRecordingPermission) mic=\(hasMicrophonePermission) speech=\(hasSpeechRecognitionPermission) screenContent=\(hasScreenContentPermission) onboarded=\(hasCompletedOnboarding)",
+            category: .permissions
+        )
         startPermissionPolling()
         bindVoiceStateObservation()
         bindAudioPowerLevel()
         bindShortcutTransitions()
-        // Eagerly touch the Claude API so its TLS warmup handshake completes
-        // well before the onboarding demo fires at ~40s into the video.
-        _ = claudeAPI
 
-        // If the user already completed onboarding AND all permissions are
-        // still granted, show the cursor overlay immediately. If permissions
-        // were revoked (e.g. signing change), don't show the cursor — the
-        // panel will show the permissions UI instead.
-        if hasCompletedOnboarding && allPermissionsGranted && isClickyCursorEnabled {
+        // Treat onboarding as already complete and show the overlay as soon
+        // as the app has everything it needs.
+        if shouldShowOverlayCursor {
             overlayWindowManager.hasShownOverlayBefore = true
             overlayWindowManager.showOverlay(onScreens: NSScreen.screens, companionManager: self)
             isOverlayVisible = true
+            nangyLog("showing overlay on app start", category: .ui)
         }
     }
 
@@ -199,20 +1154,12 @@ final class CompanionManager: ObservableObject {
     /// Triggers the onboarding sequence — dismisses the panel and restarts
     /// the overlay so the welcome animation and intro video play.
     func triggerOnboarding() {
+        completeOnboardingStateIfNeeded()
+
         // Post notification so the panel manager can dismiss the panel
         NotificationCenter.default.post(name: .clickyDismissPanel, object: nil)
 
-        // Mark onboarding as completed so the Start button won't appear
-        // again on future launches — the cursor will auto-show instead
-        hasCompletedOnboarding = true
-
-        ClickyAnalytics.trackOnboardingStarted()
-
-        // Play Besaid theme at 60% volume, fade out after 1m 30s
-        startOnboardingMusic()
-
-        // Show the overlay for the first time — isFirstAppearance triggers
-        // the welcome animation and onboarding video
+        overlayWindowManager.hasShownOverlayBefore = true
         overlayWindowManager.showOverlay(onScreens: NSScreen.screens, companionManager: self)
         isOverlayVisible = true
     }
@@ -221,13 +1168,7 @@ final class CompanionManager: ObservableObject {
     /// footer link. Same flow as triggerOnboarding but the cursor overlay
     /// is already visible so we just restart the welcome animation and video.
     func replayOnboarding() {
-        NotificationCenter.default.post(name: .clickyDismissPanel, object: nil)
-        ClickyAnalytics.trackOnboardingReplayed()
-        startOnboardingMusic()
-        // Tear down any existing overlays and recreate with isFirstAppearance = true
-        overlayWindowManager.hasShownOverlayBefore = false
-        overlayWindowManager.showOverlay(onScreens: NSScreen.screens, companionManager: self)
-        isOverlayVisible = true
+        triggerOnboarding()
     }
 
     private func stopOnboardingMusic() {
@@ -288,6 +1229,7 @@ final class CompanionManager: ObservableObject {
     }
 
     func stop() {
+        nangyLog("stopping companion manager", category: .app)
         globalPushToTalkShortcutMonitor.stop()
         buddyDictationManager.cancelCurrentDictation()
         overlayWindowManager.hideOverlay()
@@ -306,6 +1248,7 @@ final class CompanionManager: ObservableObject {
         let previouslyHadAccessibility = hasAccessibilityPermission
         let previouslyHadScreenRecording = hasScreenRecordingPermission
         let previouslyHadMicrophone = hasMicrophonePermission
+        let previouslyHadSpeechRecognition = hasSpeechRecognitionPermission
         let previouslyHadAll = allPermissionsGranted
 
         let currentlyHasAccessibility = WindowPositionManager.hasAccessibilityPermission()
@@ -321,12 +1264,17 @@ final class CompanionManager: ObservableObject {
 
         let micAuthStatus = AVCaptureDevice.authorizationStatus(for: .audio)
         hasMicrophonePermission = micAuthStatus == .authorized
+        hasSpeechRecognitionPermission = buddyDictationManager.hasSpeechRecognitionPermission
 
         // Debug: log permission state on changes
         if previouslyHadAccessibility != hasAccessibilityPermission
             || previouslyHadScreenRecording != hasScreenRecordingPermission
-            || previouslyHadMicrophone != hasMicrophonePermission {
-            print("🔑 Permissions — accessibility: \(hasAccessibilityPermission), screen: \(hasScreenRecordingPermission), mic: \(hasMicrophonePermission), screenContent: \(hasScreenContentPermission)")
+            || previouslyHadMicrophone != hasMicrophonePermission
+            || previouslyHadSpeechRecognition != hasSpeechRecognitionPermission {
+            nangyLog(
+                "permissions accessibility=\(hasAccessibilityPermission) screen=\(hasScreenRecordingPermission) mic=\(hasMicrophonePermission) speech=\(hasSpeechRecognitionPermission) screenContent=\(hasScreenContentPermission)",
+                category: .permissions
+            )
         }
 
         // Track individual permission grants as they happen
@@ -338,6 +1286,9 @@ final class CompanionManager: ObservableObject {
         }
         if !previouslyHadMicrophone && hasMicrophonePermission {
             ClickyAnalytics.trackPermissionGranted(permission: "microphone")
+        }
+        if !previouslyHadSpeechRecognition && hasSpeechRecognitionPermission {
+            ClickyAnalytics.trackPermissionGranted(permission: "speech_recognition")
         }
         // Screen content permission is persisted — once the user has approved the
         // SCShareableContent picker, we don't need to re-check it.
@@ -373,7 +1324,10 @@ final class CompanionManager: ObservableObject {
                 // Verify the capture actually returned real content — a 0x0 or
                 // fully-empty image means the user denied the prompt.
                 let didCapture = image.width > 0 && image.height > 0
-                print("🔑 Screen content capture result — width: \(image.width), height: \(image.height), didCapture: \(didCapture)")
+                nangyLog(
+                    "screen content capture width=\(image.width) height=\(image.height) didCapture=\(didCapture)",
+                    category: .permissions
+                )
                 await MainActor.run {
                     isRequestingScreenContent = false
                     guard didCapture else { return }
@@ -381,15 +1335,15 @@ final class CompanionManager: ObservableObject {
                     UserDefaults.standard.set(true, forKey: "hasScreenContentPermission")
                     ClickyAnalytics.trackPermissionGranted(permission: "screen_content")
 
-                    // If onboarding was already completed, show the cursor overlay now
-                    if hasCompletedOnboarding && allPermissionsGranted && !isOverlayVisible && isClickyCursorEnabled {
+                    if shouldShowOverlayCursor && !isOverlayVisible {
                         overlayWindowManager.hasShownOverlayBefore = true
                         overlayWindowManager.showOverlay(onScreens: NSScreen.screens, companionManager: self)
                         isOverlayVisible = true
+                        nangyLog("showing overlay after screen content grant", category: .ui)
                     }
                 }
             } catch {
-                print("⚠️ Screen content permission request failed: \(error)")
+                nangyLog(error: error, context: "screen content permission request failed", category: .permissions)
                 await MainActor.run { isRequestingScreenContent = false }
             }
         }
@@ -416,6 +1370,20 @@ final class CompanionManager: ObservableObject {
             Task { @MainActor [weak self] in
                 self?.refreshAllPermissions()
             }
+        }
+    }
+
+    private func completeOnboardingStateIfNeeded() {
+        if !hasCompletedOnboarding {
+            hasCompletedOnboarding = true
+        }
+
+        if showOnboardingPrompt || showOnboardingVideo || onboardingVideoPlayer != nil {
+            stopOnboardingMusic()
+            tearDownOnboardingVideo()
+            showOnboardingPrompt = false
+            onboardingPromptText = ""
+            onboardingPromptOpacity = 0.0
         }
     }
 
@@ -477,6 +1445,8 @@ final class CompanionManager: ObservableObject {
             // Don't register push-to-talk while the onboarding video is playing
             guard !showOnboardingVideo else { return }
 
+            nangyLog("received push-to-talk pressed transition", category: .voice, level: .debug)
+
             // Cancel any pending transient hide so the overlay stays visible
             transientHideTask?.cancel()
             transientHideTask = nil
@@ -519,9 +1489,12 @@ final class CompanionManager: ObservableObject {
                     },
                     submitDraftText: { [weak self] finalTranscript in
                         self?.lastTranscript = finalTranscript
-                        print("🗣️ Companion received transcript: \(finalTranscript)")
+                        nangyLog(
+                            "received final transcript length=\(finalTranscript.count) preview=\(NangyLogger.preview(finalTranscript, limit: 140))",
+                            category: .voice
+                        )
                         ClickyAnalytics.trackUserMessageSent(transcript: finalTranscript)
-                        self?.sendTranscriptToClaudeWithScreenshot(transcript: finalTranscript)
+                        self?.sendTranscriptToAssistantWithScreenshot(transcript: finalTranscript)
                     }
                 )
             }
@@ -530,6 +1503,7 @@ final class CompanionManager: ObservableObject {
             // before the async startPushToTalk had a chance to begin recording.
             // Without this, a quick press-and-release drops the release event and
             // leaves the waveform overlay stuck on screen indefinitely.
+            nangyLog("received push-to-talk released transition", category: .voice, level: .debug)
             ClickyAnalytics.trackPushToTalkReleased()
             pendingKeyboardShortcutStartTask?.cancel()
             pendingKeyboardShortcutStartTask = nil
@@ -578,55 +1552,73 @@ final class CompanionManager: ObservableObject {
 
     // MARK: - AI Response Pipeline
 
-    /// Captures a screenshot, sends it along with the transcript to Claude,
-    /// and plays the response aloud via ElevenLabs TTS. The cursor stays in
+    /// Captures a screenshot, sends it along with the transcript to the
+    /// configured OpenAI path and plays the response aloud via ElevenLabs TTS.
+    /// The cursor stays in
     /// the spinner/processing state until TTS audio begins playing.
-    /// Claude's response may include a [POINT:x,y:label] tag which triggers
+    /// The model response may include a [POINT:x,y:label] tag which triggers
     /// the buddy to fly to that element on screen.
-    private func sendTranscriptToClaudeWithScreenshot(transcript: String) {
+    private func sendTranscriptToAssistantWithScreenshot(transcript: String) {
         currentResponseTask?.cancel()
         elevenLabsTTSClient.stopPlayback()
+        nangyLog(
+            "starting assistant response pipeline authMode=\(preferences.authMode.rawValue) transcriptLength=\(transcript.count) preview=\(NangyLogger.preview(transcript, limit: 140))",
+            category: .assistant
+        )
 
         currentResponseTask = Task {
             // Stay in processing (spinner) state — no streaming text displayed
             voiceState = .processing
 
             do {
+                if preferences.authMode == .chatGPTOAuth && !codexAuthStatus.isLoggedIn {
+                    await codexCLIService.refreshStatus()
+                }
+
+                guard isCurrentAuthReady else {
+                    nangyLog("assistant request blocked because auth is not ready", category: .assistant, level: .warning)
+                    openSettings()
+                    speakSettingsRequiredFallback()
+                    return
+                }
+
+                if try await handleInlineTextTransformationIfPossible(for: transcript) {
+                    nangyLog("handled transcript with inline text transformation", category: .assistant)
+                    return
+                }
+
                 // Capture all connected screens so the AI has full context
                 let screenCaptures = try await CompanionScreenCaptureUtility.captureAllScreensAsJPEG()
+                nangyLog("captured screens count=\(screenCaptures.count)", category: .assistant, level: .debug)
 
                 guard !Task.isCancelled else { return }
 
                 // Build image labels with the actual screenshot pixel dimensions
-                // so Claude's coordinate space matches the image it sees. We
+                // so the model's coordinate space matches the image it sees. We
                 // scale from screenshot pixels to display points ourselves.
                 let labeledImages = screenCaptures.map { capture in
                     let dimensionInfo = " (image dimensions: \(capture.screenshotWidthInPixels)x\(capture.screenshotHeightInPixels) pixels)"
                     return (data: capture.imageData, label: capture.label + dimensionInfo)
                 }
 
-                // Pass conversation history so Claude remembers prior exchanges
-                let historyForAPI = conversationHistory.map { entry in
-                    (userPlaceholder: entry.userTranscript, assistantResponse: entry.assistantResponse)
-                }
-
-                let (fullResponseText, _) = try await claudeAPI.analyzeImageStreaming(
+                let fullResponseText = try await generateAssistantResponse(
                     images: labeledImages,
                     systemPrompt: Self.companionVoiceResponseSystemPrompt,
-                    conversationHistory: historyForAPI,
-                    userPrompt: transcript,
-                    onTextChunk: { _ in
-                        // No streaming text display — spinner stays until TTS plays
-                    }
+                    conversationHistory: conversationHistory,
+                    userPrompt: transcript
+                )
+                nangyLog(
+                    "assistant response received length=\(fullResponseText.count) preview=\(NangyLogger.preview(fullResponseText, limit: 180))",
+                    category: .assistant
                 )
 
                 guard !Task.isCancelled else { return }
 
-                // Parse the [POINT:...] tag from Claude's response
+                // Parse the [POINT:...] tag from the model response
                 let parseResult = Self.parsePointingCoordinates(from: fullResponseText)
                 let spokenText = parseResult.spokenText
 
-                // Handle element pointing if Claude returned coordinates.
+                // Handle element pointing if the model returned coordinates.
                 // Switch to idle BEFORE setting the location so the triangle
                 // becomes visible and can fly to the target. Without this, the
                 // spinner hides the triangle and the flight animation is invisible.
@@ -635,7 +1627,7 @@ final class CompanionManager: ObservableObject {
                     voiceState = .idle
                 }
 
-                // Pick the screen capture matching Claude's screen number,
+                // Pick the screen capture matching the model's screen number,
                 // falling back to the cursor screen if not specified.
                 let targetScreenCapture: CompanionScreenCapture? = {
                     if let screenNumber = parseResult.screenNumber,
@@ -647,7 +1639,7 @@ final class CompanionManager: ObservableObject {
 
                 if let pointCoordinate = parseResult.coordinate,
                    let targetScreenCapture {
-                    // Claude's coordinates are in the screenshot's pixel space
+                    // The model coordinates are in the screenshot's pixel space
                     // (top-left origin, e.g. 1280x831). Scale to the display's
                     // point space (e.g. 1512x982), then convert to AppKit global coords.
                     let screenshotWidth = CGFloat(targetScreenCapture.screenshotWidthInPixels)
@@ -676,9 +1668,16 @@ final class CompanionManager: ObservableObject {
                     detectedElementScreenLocation = globalLocation
                     detectedElementDisplayFrame = displayFrame
                     ClickyAnalytics.trackElementPointed(elementLabel: parseResult.elementLabel)
-                    print("🎯 Element pointing: (\(Int(pointCoordinate.x)), \(Int(pointCoordinate.y))) → \"\(parseResult.elementLabel ?? "element")\"")
+                    nangyLog(
+                        "element pointing x=\(Int(pointCoordinate.x)) y=\(Int(pointCoordinate.y)) label=\(parseResult.elementLabel ?? "element")",
+                        category: .assistant
+                    )
                 } else {
-                    print("🎯 Element pointing: \(parseResult.elementLabel ?? "no element")")
+                    nangyLog(
+                        "element pointing skipped label=\(parseResult.elementLabel ?? "none")",
+                        category: .assistant,
+                        level: .debug
+                    )
                 }
 
                 // Save this exchange to conversation history (with the point tag
@@ -693,7 +1692,7 @@ final class CompanionManager: ObservableObject {
                     conversationHistory.removeFirst(conversationHistory.count - 10)
                 }
 
-                print("🧠 Conversation history: \(conversationHistory.count) exchanges")
+                nangyLog("conversation history count=\(conversationHistory.count)", category: .assistant, level: .debug)
 
                 ClickyAnalytics.trackAIResponseReceived(response: spokenText)
 
@@ -706,22 +1705,186 @@ final class CompanionManager: ObservableObject {
                         voiceState = .responding
                     } catch {
                         ClickyAnalytics.trackTTSError(error: error.localizedDescription)
-                        print("⚠️ ElevenLabs TTS error: \(error)")
-                        speakCreditsErrorFallback()
+                        nangyLog(error: error, context: "TTS playback failed", category: .tts)
+                        speakLocally(spokenText)
                     }
                 }
             } catch is CancellationError {
                 // User spoke again — response was interrupted
+                nangyLog("assistant response pipeline cancelled", category: .assistant, level: .debug)
+            } catch ClickyAssistantError.settingsRequired {
+                nangyLog("assistant response requires settings before continuing", category: .assistant, level: .warning)
+                openSettings()
+                speakSettingsRequiredFallback()
             } catch {
                 ClickyAnalytics.trackResponseError(error: error.localizedDescription)
-                print("⚠️ Companion response error: \(error)")
-                speakCreditsErrorFallback()
+                nangyLog(error: error, context: "assistant response pipeline failed", category: .assistant)
+                speakResponseErrorFallback(for: error)
             }
 
             if !Task.isCancelled {
                 voiceState = .idle
                 scheduleTransientHideIfNeeded()
             }
+        }
+    }
+
+    private func generateAssistantResponse(
+        images: [(data: Data, label: String)],
+        systemPrompt: String,
+        conversationHistory: [(userTranscript: String, assistantResponse: String)],
+        userPrompt: String
+    ) async throws -> String {
+        let currentPreferences = preferences
+        nangyLog(
+            "routing assistant response authMode=\(currentPreferences.authMode.rawValue) model=\(currentPreferences.model) reasoning=\(currentPreferences.reasoningEffort.rawValue) tier=\(currentPreferences.serviceTier.rawValue)",
+            category: .assistant
+        )
+
+        switch currentPreferences.authMode {
+        case .apiKey:
+            guard let apiKey = loadAPIKey(), !apiKey.isEmpty else {
+                nangyLog("API key mode selected but no API key is saved", category: .assistant, level: .warning)
+                throw ClickyAssistantError.settingsRequired
+            }
+
+            let (responseText, _) = try await openAIAPI.analyzeImage(
+                images: images,
+                systemPrompt: systemPrompt,
+                conversationHistory: conversationHistory,
+                userPrompt: userPrompt,
+                apiKey: apiKey,
+                model: currentPreferences.model,
+                reasoning: currentPreferences.reasoningEffort,
+                serviceTier: currentPreferences.serviceTier
+            )
+            nangyLog("assistant routed through direct OpenAI API", category: .assistant, level: .debug)
+            return responseText
+
+        case .chatGPTOAuth:
+            if !codexAuthStatus.isLoggedIn {
+                await codexCLIService.refreshStatus()
+            }
+
+            guard codexAuthStatus.isLoggedIn else {
+                nangyLog("OAuth mode selected but Codex is not logged in", category: .assistant, level: .warning)
+                throw ClickyAssistantError.settingsRequired
+            }
+
+            nangyLog("assistant routed through Codex CLI OAuth", category: .assistant, level: .debug)
+            return try await codexCLIService.generateResponse(
+                images: images,
+                systemPrompt: systemPrompt,
+                conversationHistory: conversationHistory,
+                userPrompt: userPrompt,
+                model: currentPreferences.model,
+                reasoning: currentPreferences.reasoningEffort,
+                serviceTier: currentPreferences.serviceTier
+            )
+        }
+    }
+
+    private func handleInlineTextTransformationIfPossible(for instruction: String) async throws -> Bool {
+        guard NangyTextTransformPromptComposer.looksLikeTextTransformInstruction(instruction) else {
+            return false
+        }
+
+        guard hasAccessibilityPermission && accessibilityTextService.hasPermission() else {
+            nangyLog(
+                "skipping inline text transformation because accessibility is unavailable",
+                category: .assistant,
+                level: .debug
+            )
+            return false
+        }
+
+        let selectionContext: NangySelectionContext
+        do {
+            selectionContext = try await accessibilityTextService.captureCurrentSelection()
+        } catch NangySelectionCaptureError.noFocusedElement, NangySelectionCaptureError.noSelectedText {
+            nangyLog("no highlighted text found for inline transformation", category: .assistant, level: .debug)
+            return false
+        } catch NangySelectionCaptureError.accessibilityPermissionDenied {
+            nangyLog(
+                "inline transformation blocked because accessibility permission is denied",
+                category: .assistant,
+                level: .warning
+            )
+            return false
+        } catch {
+            nangyLog(error: error, context: "failed to capture selected text", category: .assistant)
+            return false
+        }
+
+        guard NangyTextTransformPromptComposer.shouldRewriteSelectedText(
+            instruction: instruction,
+            selectedText: selectionContext.selectedText
+        ) else {
+            return false
+        }
+
+        let prompt = NangyTextTransformPromptComposer.compose(
+            instruction: instruction,
+            selectedText: selectionContext.selectedText
+        )
+        nangyLog(
+            "running inline transformation app=\(selectionContext.appName) captureMethod=\(String(describing: selectionContext.captureMethod)) selectedLength=\(selectionContext.selectedText.count)",
+            category: .assistant
+        )
+
+        let replacementText = try await generateInlineTextTransformation(prompt: prompt)
+        guard !Task.isCancelled else { return true }
+
+        try await accessibilityTextService.replaceSelection(
+            in: selectionContext,
+            with: replacementText
+        )
+
+        nangyLog(
+            "inline transformation replaced selection app=\(selectionContext.appName) replacementLength=\(replacementText.count)",
+            category: .assistant
+        )
+        return true
+    }
+
+    private func generateInlineTextTransformation(prompt: String) async throws -> String {
+        let currentPreferences = preferences
+        nangyLog(
+            "routing inline text transformation authMode=\(currentPreferences.authMode.rawValue) model=\(currentPreferences.model) reasoning=\(currentPreferences.reasoningEffort.rawValue) tier=\(currentPreferences.serviceTier.rawValue)",
+            category: .assistant
+        )
+
+        switch currentPreferences.authMode {
+        case .apiKey:
+            guard let apiKey = loadAPIKey(), !apiKey.isEmpty else {
+                throw ClickyAssistantError.settingsRequired
+            }
+
+            return try await openAIAPI.transformText(
+                prompt: prompt,
+                systemPrompt: NangyTextTransformPromptComposer.systemInstruction,
+                apiKey: apiKey,
+                model: currentPreferences.model,
+                reasoning: currentPreferences.reasoningEffort,
+                serviceTier: currentPreferences.serviceTier
+            )
+
+        case .chatGPTOAuth:
+            if !codexAuthStatus.isLoggedIn {
+                await codexCLIService.refreshStatus()
+            }
+
+            guard codexAuthStatus.isLoggedIn else {
+                throw ClickyAssistantError.settingsRequired
+            }
+
+            return try await codexCLIService.transformText(
+                prompt: prompt,
+                systemPrompt: NangyTextTransformPromptComposer.systemInstruction,
+                model: currentPreferences.model,
+                reasoning: currentPreferences.reasoningEffort,
+                serviceTier: currentPreferences.serviceTier
+            )
         }
     }
 
@@ -755,23 +1918,47 @@ final class CompanionManager: ObservableObject {
         }
     }
 
-    /// Speaks a hardcoded error message using macOS system TTS when API
-    /// credits run out. Uses NSSpeechSynthesizer so it works even when
-    /// ElevenLabs is down.
-    private func speakCreditsErrorFallback() {
-        let utterance = "I'm all out of credits. Please DM Farza and tell him to bring me back to life."
-        let synthesizer = NSSpeechSynthesizer()
-        synthesizer.startSpeaking(utterance)
+    private func speakLocally(_ utterance: String) {
+        elevenLabsTTSClient.speakLocally(utterance)
         voiceState = .responding
+        nangyLog(
+            "using local speech fallback utteranceLength=\(utterance.count) preview=\(NangyLogger.preview(utterance, limit: 160))",
+            category: .tts,
+            level: .warning
+        )
+    }
+
+    private func speakResponseErrorFallback(for error: Error) {
+        let message = (error as? LocalizedError)?.errorDescription?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let utterance: String
+
+        if let message, !message.isEmpty {
+            utterance = "I hit an OpenAI error. \(message)"
+        } else {
+            utterance = "I hit an OpenAI error. Check your sign in, network, or model settings and try again."
+        }
+
+        nangyLog(
+            "speaking response error fallback preview=\(NangyLogger.preview(utterance, limit: 180))",
+            category: .tts,
+            level: .warning
+        )
+        speakLocally(utterance)
+    }
+
+    private func speakSettingsRequiredFallback() {
+        nangyLog("speaking settings required fallback", category: .tts, level: .warning)
+        speakLocally("Open Nangy settings and connect OpenAI first.")
     }
 
     // MARK: - Point Tag Parsing
 
-    /// Result of parsing a [POINT:...] tag from Claude's response.
+    /// Result of parsing a [POINT:...] tag from the model's response.
     struct PointingParseResult {
         /// The response text with the [POINT:...] tag removed — this is what gets spoken.
         let spokenText: String
-        /// The parsed pixel coordinate, or nil if Claude said "none" or no tag was found.
+        /// The parsed pixel coordinate, or nil if the model said "none" or no tag was found.
         let coordinate: CGPoint?
         /// Short label describing the element (e.g. "run button"), or "none".
         let elementLabel: String?
@@ -779,7 +1966,7 @@ final class CompanionManager: ObservableObject {
         let screenNumber: Int?
     }
 
-    /// Parses a [POINT:x,y:label:screenN] or [POINT:none] tag from the end of Claude's response.
+    /// Parses a [POINT:x,y:label:screenN] or [POINT:none] tag from the end of the model response.
     /// Returns the spoken text (tag removed) and the optional coordinate + label + screen number.
     static func parsePointingCoordinates(from responseText: String) -> PointingParseResult {
         // Match [POINT:none] or [POINT:123,456:label] or [POINT:123,456:label:screen2]
@@ -961,7 +2148,7 @@ final class CompanionManager: ObservableObject {
     the screenshot images are labeled with their pixel dimensions. use those dimensions as the coordinate space. origin (0,0) is top-left. x increases rightward, y increases downward.
     """
 
-    /// Captures a screenshot and asks Claude to find something interesting to
+    /// Captures a screenshot and asks the configured model to find something interesting to
     /// point at, then triggers the buddy's flight animation. Used during
     /// onboarding to demo the pointing feature while the intro video plays.
     func performOnboardingDemoInteraction() {
@@ -970,9 +2157,15 @@ final class CompanionManager: ObservableObject {
 
         Task {
             do {
+                if preferences.authMode == .chatGPTOAuth && !codexAuthStatus.isLoggedIn {
+                    await codexCLIService.refreshStatus()
+                }
+
+                guard isCurrentAuthReady else { return }
+
                 let screenCaptures = try await CompanionScreenCaptureUtility.captureAllScreensAsJPEG()
 
-                // Only send the cursor screen so Claude can't pick something
+                // Only send the cursor screen so the model can't pick something
                 // on a different monitor that we can't point at.
                 guard let cursorScreenCapture = screenCaptures.first(where: { $0.isCursorScreen }) else {
                     print("🎯 Onboarding demo: no cursor screen found")
@@ -982,11 +2175,11 @@ final class CompanionManager: ObservableObject {
                 let dimensionInfo = " (image dimensions: \(cursorScreenCapture.screenshotWidthInPixels)x\(cursorScreenCapture.screenshotHeightInPixels) pixels)"
                 let labeledImages = [(data: cursorScreenCapture.imageData, label: cursorScreenCapture.label + dimensionInfo)]
 
-                let (fullResponseText, _) = try await claudeAPI.analyzeImageStreaming(
+                let fullResponseText = try await generateAssistantResponse(
                     images: labeledImages,
                     systemPrompt: Self.onboardingDemoSystemPrompt,
+                    conversationHistory: [],
                     userPrompt: "look around my screen and find something interesting to point at",
-                    onTextChunk: { _ in }
                 )
 
                 let parseResult = Self.parsePointingCoordinates(from: fullResponseText)
@@ -1012,7 +2205,7 @@ final class CompanionManager: ObservableObject {
                     y: appKitY + displayFrame.origin.y
                 )
 
-                // Set custom bubble text so the pointing animation uses Claude's
+                // Set custom bubble text so the pointing animation uses the
                 // comment instead of a random phrase
                 detectedElementBubbleText = parseResult.spokenText
                 detectedElementScreenLocation = globalLocation

@@ -2,6 +2,9 @@ worker/node_modules/
 worker/.dev.vars
 .DS_Store
 *.xcuserstate
+*.xcuserdatad/
+.deriveddata/
+*.profraw
 build/
 releases/
 .claude/

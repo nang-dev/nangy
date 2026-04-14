@@ -784,8 +784,9 @@ class OverlayWindowManager {
         // Hide any existing overlays
         hideOverlay()
 
-        // Track if this is the first time showing overlay (welcome message)
-        let isFirstAppearance = !hasShownOverlayBefore
+        // Onboarding is treated as already complete, so the overlay always
+        // skips the intro sequence and comes up ready to use.
+        let isFirstAppearance = false
         hasShownOverlayBefore = true
 
         // Create one overlay window per screen

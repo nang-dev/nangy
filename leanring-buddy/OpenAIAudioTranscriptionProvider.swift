@@ -17,12 +17,23 @@ struct OpenAIAudioTranscriptionProviderError: LocalizedError {
 }
 
 final class OpenAIAudioTranscriptionProvider: BuddyTranscriptionProvider {
-    private let apiKey = AppBundleConfiguration.stringValue(forKey: "OpenAIAPIKey")
+    private let keychainStore = ClickyKeychainStore()
+    private let apiKeyAccount = "openai_api_key"
     private let modelName = AppBundleConfiguration.stringValue(forKey: "OpenAITranscriptionModel")
         ?? "gpt-4o-transcribe"
 
     let displayName = "OpenAI"
     let requiresSpeechRecognitionPermission = false
+
+    private var apiKey: String? {
+        if let savedKey = keychainStore.loadString(for: apiKeyAccount)?
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+           !savedKey.isEmpty {
+            return savedKey
+        }
+
+        return AppBundleConfiguration.stringValue(forKey: "OpenAIAPIKey")
+    }
 
     var isConfigured: Bool {
         apiKey != nil
@@ -30,7 +41,7 @@ final class OpenAIAudioTranscriptionProvider: BuddyTranscriptionProvider {
 
     var unavailableExplanation: String? {
         guard !isConfigured else { return nil }
-        return "OpenAI transcription is not configured. Add OpenAIAPIKey to Info.plist."
+        return "OpenAI transcription is not configured. Save an OpenAI API key in Settings."
     }
 
     func startStreamingSession(
@@ -40,10 +51,16 @@ final class OpenAIAudioTranscriptionProvider: BuddyTranscriptionProvider {
         onError: @escaping (Error) -> Void
     ) async throws -> any BuddyStreamingTranscriptionSession {
         guard let apiKey else {
+            nangyLog("OpenAI transcription requested without API key", category: .transcription, level: .error)
             throw OpenAIAudioTranscriptionProviderError(
                 message: unavailableExplanation ?? "OpenAI transcription is not configured."
             )
         }
+
+        nangyLog(
+            "starting OpenAI transcription session model=\(modelName) keytermCount=\(keyterms.count)",
+            category: .transcription
+        )
 
         return OpenAIAudioTranscriptionSession(
             apiKey: apiKey,
@@ -123,6 +140,11 @@ private final class OpenAIAudioTranscriptionSession: BuddyStreamingTranscription
         stateQueue.async {
             guard !self.hasRequestedFinalTranscript, !self.isCancelled else { return }
             self.hasRequestedFinalTranscript = true
+            nangyLog(
+                "OpenAI transcription final transcript requested bufferedBytes=\(self.bufferedPCM16AudioData.count)",
+                category: .transcription,
+                level: .debug
+            )
 
             let bufferedPCM16AudioData = self.bufferedPCM16AudioData
             self.transcriptionUploadTask = Task { [weak self] in
@@ -166,10 +188,19 @@ private final class OpenAIAudioTranscriptionSession: BuddyStreamingTranscription
                 onTranscriptUpdate(transcriptText)
             }
 
+            nangyLog(
+                "OpenAI transcription completed audioBytes=\(wavAudioData.count) transcriptLength=\(transcriptText.count)",
+                category: .transcription
+            )
             deliverFinalTranscript(transcriptText)
         } catch {
             guard !stateQueue.sync(execute: { isCancelled }) else { return }
-            print("[OpenAI Transcription] ❌ Upload failed (audio size: \(wavAudioData.count) bytes): \(error.localizedDescription)")
+            nangyLog(
+                "OpenAI transcription upload failed audioBytes=\(wavAudioData.count)",
+                category: .transcription,
+                level: .error
+            )
+            nangyLog(error: error, context: "OpenAI transcription upload failed", category: .transcription)
             onError(error)
         }
     }
@@ -187,9 +218,16 @@ private final class OpenAIAudioTranscriptionSession: BuddyStreamingTranscription
         )
         request.httpBody = requestBodyData
 
+        nangyLog(
+            "uploading OpenAI transcription audioBytes=\(wavAudioData.count) requestBytes=\(requestBodyData.count)",
+            category: .transcription,
+            level: .debug
+        )
+
         let (responseData, response) = try await urlSession.data(for: request)
 
         guard let httpResponse = response as? HTTPURLResponse else {
+            nangyLog("OpenAI transcription returned invalid response object", category: .transcription, level: .error)
             throw OpenAIAudioTranscriptionProviderError(
                 message: "OpenAI transcription returned an invalid response."
             )
@@ -197,6 +235,11 @@ private final class OpenAIAudioTranscriptionSession: BuddyStreamingTranscription
 
         guard (200...299).contains(httpResponse.statusCode) else {
             let responseText = String(data: responseData, encoding: .utf8) ?? "Unknown error"
+            nangyLog(
+                "OpenAI transcription failed status=\(httpResponse.statusCode) bodyPreview=\(NangyLogger.preview(responseText, limit: 220))",
+                category: .transcription,
+                level: .error
+            )
             throw OpenAIAudioTranscriptionProviderError(
                 message: "OpenAI transcription failed: \(responseText)"
             )

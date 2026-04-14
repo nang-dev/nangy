@@ -38,7 +38,7 @@ enum BuddyTranscriptionProviderFactory {
 
     static func makeDefaultProvider() -> any BuddyTranscriptionProvider {
         let provider = resolveProvider()
-        print("🎙️ Transcription: using \(provider.displayName)")
+        nangyLog("selected transcription provider=\(provider.displayName)", category: .transcription)
         return provider
     }
 
@@ -60,14 +60,18 @@ enum BuddyTranscriptionProviderFactory {
                 return assemblyAIProvider
             }
 
-            print("⚠️ Transcription: AssemblyAI preferred but not configured, falling back")
+            nangyLog(
+                "AssemblyAI preferred but not configured, falling back",
+                category: .transcription,
+                level: .warning
+            )
 
             if openAIProvider.isConfigured {
-                print("⚠️ Transcription: using OpenAI as fallback")
+                nangyLog("using OpenAI transcription fallback", category: .transcription, level: .warning)
                 return openAIProvider
             }
 
-            print("⚠️ Transcription: using Apple Speech as fallback")
+            nangyLog("using Apple Speech transcription fallback", category: .transcription, level: .warning)
             return AppleSpeechTranscriptionProvider()
         }
 
@@ -76,14 +80,18 @@ enum BuddyTranscriptionProviderFactory {
                 return openAIProvider
             }
 
-            print("⚠️ Transcription: OpenAI preferred but not configured, falling back")
+            nangyLog(
+                "OpenAI transcription preferred but not configured, falling back",
+                category: .transcription,
+                level: .warning
+            )
 
             if assemblyAIProvider.isConfigured {
-                print("⚠️ Transcription: using AssemblyAI as fallback")
+                nangyLog("using AssemblyAI transcription fallback", category: .transcription, level: .warning)
                 return assemblyAIProvider
             }
 
-            print("⚠️ Transcription: using Apple Speech as fallback")
+            nangyLog("using Apple Speech transcription fallback", category: .transcription, level: .warning)
             return AppleSpeechTranscriptionProvider()
         }
 

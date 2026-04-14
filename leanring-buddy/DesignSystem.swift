@@ -58,10 +58,9 @@ enum DS {
         /// Tertiary text — very muted, used for section labels, timestamps, disabled text.
         static let textTertiary = Color(hex: "#6B736F")
 
-        /// Text used on top of the accent fill (#2563eb blue), like the primary button label.
-        /// White on #2563eb achieves ~5.1:1 contrast — WCAG AA compliant.
-        /// White on #1d4ed8 hover achieves ~6.5:1 — also WCAG AA compliant.
-        static let textOnAccent: Color = .white
+        /// Text used on top of the accent fill. The accent is intentionally bright,
+        /// so a deep navy text color keeps primary buttons readable.
+        static let textOnAccent = Color(hex: "#062536")
 
         // ── Tailwind Blue Scale ─────────────────────────────────────
         // Full Tailwind CSS v4 blue palette for consistent blue usage.
@@ -76,28 +75,26 @@ enum DS {
         //   800–900 → Deep backgrounds, dark overlays, header bars
         //   950     → Deepest blue — near-black tinted backgrounds
 
-        static let blue50  = Color(hex: "#eff6ff")
-        static let blue100 = Color(hex: "#dbeafe")
-        static let blue200 = Color(hex: "#bfdbfe")
-        static let blue300 = Color(hex: "#93c5fd")
-        static let blue400 = Color(hex: "#60a5fa")
-        static let blue500 = Color(hex: "#3b82f6")
-        static let blue600 = Color(hex: "#2563eb")
-        static let blue700 = Color(hex: "#1d4ed8")
-        static let blue800 = Color(hex: "#1e40af")
-        static let blue900 = Color(hex: "#1e3a8a")
-        static let blue950 = Color(hex: "#172554")
+        static let blue50  = Color(hex: "#F1FBFF")
+        static let blue100 = Color(hex: "#D9F5FF")
+        static let blue200 = Color(hex: "#B4ECFF")
+        static let blue300 = Color(hex: "#86DEFC")
+        static let blue400 = Color(hex: "#48C2F9")
+        static let blue500 = Color(hex: "#2FAFE9")
+        static let blue600 = Color(hex: "#1798D2")
+        static let blue700 = Color(hex: "#117CAF")
+        static let blue800 = Color(hex: "#0E628B")
+        static let blue900 = Color(hex: "#0D4D6D")
+        static let blue950 = Color(hex: "#082D3E")
 
         // ── Accent (derived from blue scale) ───────────────────────
         // The primary fill is Blue 600; hover darkens to Blue 700.
 
         /// Accent fill — used for solid button backgrounds.
-        /// #2563eb → ~5.1:1 contrast with white text (WCAG AA).
-        static let accent = blue600
+        static let accent = blue400
 
-        /// Accent hover — slightly darker blue for hover state.
-        /// #1d4ed8 → ~6.5:1 contrast with white text (WCAG AA+).
-        static let accentHover = blue700
+        /// Accent hover — slightly darker cyan for hover state.
+        static let accentHover = blue500
 
         /// Accent text — bright blue used for accent-colored text and icons
         /// on dark backgrounds (links, active nav items, highlighted labels).
@@ -141,7 +138,7 @@ enum DS {
         /// The blue cursor/bubble color used in OverlayWindow.
         /// Kept distinct from the accent since it serves a different purpose
         /// (screen overlay vs in-app UI).
-        static let overlayCursorBlue = Color(hex: "#3380FF")
+        static let overlayCursorBlue = blue400
 
         // ── Floating Button Gradient ─────────────────────────────────
 
