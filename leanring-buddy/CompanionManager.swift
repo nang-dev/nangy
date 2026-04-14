@@ -1567,6 +1567,15 @@ final class CompanionManager: ObservableObject {
         )
 
         currentResponseTask = Task {
+            defer {
+                currentResponseTask = nil
+
+                if !Task.isCancelled {
+                    voiceState = .idle
+                    scheduleTransientHideIfNeeded()
+                }
+            }
+
             // Stay in processing (spinner) state — no streaming text displayed
             voiceState = .processing
 
@@ -1720,11 +1729,6 @@ final class CompanionManager: ObservableObject {
                 ClickyAnalytics.trackResponseError(error: error.localizedDescription)
                 nangyLog(error: error, context: "assistant response pipeline failed", category: .assistant)
                 speakResponseErrorFallback(for: error)
-            }
-
-            if !Task.isCancelled {
-                voiceState = .idle
-                scheduleTransientHideIfNeeded()
             }
         }
     }
